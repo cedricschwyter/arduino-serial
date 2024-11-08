@@ -1,0 +1,18 @@
+[package]
+name = "arduino-serial"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[bin]]
+name = 'arduino-serial'
+path = "./main.rs"
+
+[dependencies]
+clap = { version = "4.5.20", features = ["derive"] }
+env_logger = "0.11.5"
+log = "0.4.22"
+mio-serial = { version = "5.0.5", features = ["libudev"] }
+tokio = { version = "1.41.1", features = ["full"] }
+tokio-serial = { version = "5.4.4", features = ["rt"] }
