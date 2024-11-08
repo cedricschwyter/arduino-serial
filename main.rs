@@ -1,4 +1,4 @@
-use std::{io::Write, time::Duration};
+use std::{fs::File, io::Write, time::Duration};
 
 use clap::Parser;
 use env_logger::{Builder, Env};
@@ -22,6 +22,14 @@ pub(crate) struct Args {
     pub(crate) fec_threshold: u64,
     #[arg(short, long, default_value_t = 5)]
     pub(crate) retransmissions: u64,
+    #[arg(short, long, default_value_t = 20)]
+    pub(crate) channel_busy_threshold: u64,
+    #[arg(short, long, default_value_t = false)]
+    pub(crate) flood: bool,
+    #[arg(short, long, default_value_t = 200)]
+    pub(crate) flood_packet_size: usize,
+    #[arg(short, long)]
+    pub(crate) statistics_path: Option<String>,
 }
 
 #[tokio::main]
@@ -44,6 +52,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::sleep(Duration::from_millis(1000));
     port.write_fmt(format_args!("c[0,1,{}]\n", args.fec_threshold))?;
     std::thread::sleep(Duration::from_millis(1000));
+    port.write_fmt(format_args!("c[0,2,{}]\n", args.channel_busy_threshold))?;
+    std::thread::sleep(Duration::from_millis(1000));
 
     info!(
         "Successfully connected to and configured device {} with address {}",
@@ -53,12 +63,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (serial_reader, serial_writer) = tokio::io::split(port);
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(200);
+    let (statistics_tx, mut statistics_rx) = tokio::sync::mpsc::channel::<String>(1024);
+
+    let statistics_task = {
+        let args = args.clone();
+        tokio::task::spawn(async move {
+            if args.statistics_path.is_none() {
+                return;
+            }
+            let mut writer = File::create(args.statistics_path.unwrap()).unwrap();
+            while let Some(data) = statistics_rx.recv().await {
+                if let Err(e) = writer.write_all(data.as_bytes()) {
+                    error!("Error writing to statistics file: {}", e);
+                    break;
+                }
+            }
+        })
+    };
 
     let reader = {
+        let tx = tx.clone();
         let args = args.clone();
         tokio::task::spawn(async move {
             let mut reader = BufReader::new(serial_reader);
             let mut buffer = Vec::new();
+            if args.flood {
+                if tx
+                    .send(
+                        format!(
+                            "m[{}\0,{}]\n",
+                            "A".repeat(args.flood_packet_size),
+                            args.them
+                        )
+                        .into_bytes(),
+                    )
+                    .await
+                    .is_err()
+                {
+                    error!("Receiver dropped");
+                    return;
+                }
+            }
             loop {
                 buffer.clear();
                 match reader.read_until(b'\n', &mut buffer).await {
@@ -74,6 +119,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             args.us,
                             value
                         );
+                        if args.statistics_path.is_some() && value.starts_with("s") {
+                            statistics_tx
+                                .send(String::from_utf8_lossy(&buffer[..n]).to_string())
+                                .await
+                                .unwrap();
+                        }
+                        if args.flood && value.starts_with("m[D") {
+                            let _ = tokio::time::sleep(Duration::from_millis(10)).await;
+                            if tx
+                                .send(
+                                    format!(
+                                        "m[{}\0,{}]\n",
+                                        "A".repeat(args.flood_packet_size),
+                                        args.them
+                                    )
+                                    .into_bytes(),
+                                )
+                                .await
+                                .is_err()
+                            {
+                                error!("Receiver dropped");
+                                break;
+                            }
+                        }
                         if value.starts_with("m[R,D") {
                             let value = String::from_utf8_lossy(&buffer[6..(n - 2)]);
                             info!(
@@ -120,7 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    tokio::try_join!(reader, writer, serial_writer)?;
+    tokio::try_join!(reader, writer, serial_writer, statistics_task)?;
 
     Ok(())
 }
